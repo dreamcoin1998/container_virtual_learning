@@ -12,7 +12,7 @@
 
 - SIGKILL和SIGTERM信号都是Linux信号，SIGKILL和SIGSTOP属于不能被忽略和handle的内核信号，主要提供给内核进程和root用户进行特权操作。
 - 使用kill命令的时候，缺省状态下，kill 1 向init进程发送SIGTREM信号
-- Ctrl+C发送的是SIGKILL信号
+- Ctrl+C发送的是SIGING信号
 
 ## 编程语言的signal
 
