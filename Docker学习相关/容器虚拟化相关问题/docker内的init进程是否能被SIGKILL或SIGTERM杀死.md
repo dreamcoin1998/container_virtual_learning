@@ -547,7 +547,6 @@ stateDiagram
     SYSCALL_DEFINE2 --> prepare_kill_siginfo
     prepare_kill_siginfo --> task_tgid_vnr
     task_tgid_vnr --> pid_nr_ns
-    from_kuid_munged --> current_user_ns
     prepare_kill_siginfo --> kill_something_info
     kill_something_info --> kill_proc_info
     kill_proc_info --> kill_pid_info
@@ -561,8 +560,13 @@ stateDiagram
     send_signal --> task_pid_nr_ns
     send_signal --> has_si_pid_and_uid
     has_si_pid_and_uid --> current_user_ns
+    has_si_pid_and_uid --> task_pid_nr_ns
+    current_user_ns --> make_kuid
+    make_kuid --> from_kuid_munged
     task_pid_nr_ns --> task_active_pid_ns
     send_signal --> __send_signal
+    from_kuid_munged --> __send_signal
+    task_active_pid_ns --> __send_signal
     __send_signal --> [*]
 ```
 
