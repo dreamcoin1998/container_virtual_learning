@@ -2,7 +2,7 @@
 
 # 问题
 
-在容器内给容器内的init进程发送SIGTERM信号，init进程会不会被杀死，发送SIGKILL信号呢？在进程外发送信号呢？为什么？
+在容器内给容器内的init进程发送SIGTERM信号，init进程会不会被杀死，发送SIGKILL信号呢？在容器外发送信号呢？为什么？
 
 *问题来源：极客时间*
 
@@ -95,7 +95,7 @@ static inline void prepare_kill_siginfo(int sig, struct kernel_siginfo *info)
 	clear_siginfo(info);
 	info->si_signo = sig; // 传入的信号
 	info->si_errno = 0;
-	info->si_code = SI_USER; 
+	info->si_code = SI_USER; // 产生自用户空间
 	info->si_pid = task_tgid_vnr(current); // 主要是从当前namespace 中找到对应的pid号。
 	info->si_uid = from_kuid_munged(current_user_ns(), current_uid()); // 返回0，也就是root用户
 }
@@ -108,8 +108,8 @@ static inline void prepare_kill_siginfo(int sig, struct kernel_siginfo *info)
  * si_code values
  * Digital reserves positive values for kernel-generated signals.
  */
-#define SI_USER		0		/* sent by kill, sigsend, raise */
-#define SI_KERNEL	0x80		/* sent by the kernel from somewhere */
+#define SI_USER		0		/* sent by kill, sigsend, raise 由kill、raise等发送的*/
+#define SI_KERNEL	0x80		/* sent by the kernel from somewhere 从内核某处发送 */
 #define SI_QUEUE	-1		/* sent by sigqueue */
 #define SI_TIMER	-2		/* sent by timer expiration */
 #define SI_MESGQ	-3		/* sent by real time mesq state change */
@@ -301,17 +301,19 @@ int group_send_sig_info(int sig, struct kernel_siginfo *info,
 	int ret;
 
 	rcu_read_lock();
-	ret = check_kill_permission(sig, info, p);
+	ret = check_kill_permission(sig, info, p); 
+    // 检查是否是有效信号，检测是否来自用户或内核
+    // 来自用户需要记录审计日志后返回0，来自内核直接返回0
 	rcu_read_unlock();
 
-	if (!ret && sig)
+	if (!ret && sig) // 如果是有效信号，调用do_send_sig_info
 		ret = do_send_sig_info(sig, info, p, type);
 
 	return ret;
 }
 ```
 
-然后是check_kill_permission：
+我们来看看check_kill_permission的调用链：
 
 ```c
 /*
@@ -327,14 +329,14 @@ static int check_kill_permission(int sig, struct kernel_siginfo *info,
 	if (!valid_signal(sig))  // return sig <= _NSIG ? 1 : 0; _NSIG == 64 这里检测是否是一个有效的信号
 		return -EINVAL; // EINVAL 宏定义 22
 
-	if (!si_fromuser(info))
+	if (!si_fromuser(info)) // si_fromuser判断是否是来自用户，是返回True
 		return 0;
 
-	error = audit_signal_info(sig, t); /* Let audit system see the signal */
+	error = audit_signal_info(sig, t); // 记录审计日志，这里始终返回0
 	if (error)
 		return error;
 
-	if (!same_thread_group(current, t) &&
+	if (!same_thread_group(current, t) && // current和当前进程信号是否一致
 	    !kill_ok_by_cred(t)) {
 		switch (sig) {
 		case SIGCONT:
@@ -351,8 +353,216 @@ static int check_kill_permission(int sig, struct kernel_siginfo *info,
 		}
 	}
 
-	return security_task_kill(t, info, sig, NULL);
+	return security_task_kill(t, info, sig, NULL); // 返回0
 }
 ```
 
-先到这里，实在太长了这代码。。。
+si_fromuser：
+
+```c
+static inline bool si_fromuser(const struct kernel_siginfo *info)
+{
+	return info == SEND_SIG_NOINFO || // SEND_SIG_NOINFO为SI_USER，这里info.si_code为SI_USER故为True
+		(!is_si_special(info) && SI_FROMUSER(info)); 
+    	// is_si_special函数关键处为info <= SEND_SIG_PRIV; SEND_SIG_PRIV即SI_KERNEL表示由内核发送
+    	// 故is_si_special(info)为True，即!is_si_special(info)为false
+    	// SI_FROMUSER为下列宏定义
+    	// #define SI_FROMUSER(siptr)	((siptr)->si_code <= 0)
+    	// 故这里SI_FROMUSER(info)为True
+    	// 综上所述，si_fromuser判断sig是否来自用户
+}
+```
+
+进入audit_signal_info(sig, t)调用：
+
+```c
+/**
+ * audit_signal_info - record signal info for shutting down audit subsystem
+ * @sig: signal value
+ * @t: task being signaled
+ *
+ * If the audit subsystem is being terminated, record the task (pid)
+ * and uid that is doing that.
+ */
+int audit_signal_info(int sig, struct task_struct *t)
+{
+	kuid_t uid = current_uid(), auid;
+
+	if (auditd_test_task(t) && // auditd_test_task判断是否是注册的审计进程，是返回1，否返回0
+	    (sig == SIGTERM || sig == SIGHUP ||
+	     sig == SIGUSR1 || sig == SIGUSR2)) { // 如果sig是SIGTERM、SIGHUP或用户自定义的SIGUSR1和SIGUSR2
+		audit_sig_pid = task_tgid_nr(current);
+		auid = audit_get_loginuid(current);
+		if (uid_valid(auid))
+			audit_sig_uid = auid;
+		else
+			audit_sig_uid = uid;
+		security_task_getsecid(current, &audit_sig_sid);
+	}
+
+	return audit_signal_info_syscall(t); // 始终返回0
+}
+```
+
+auditd_test_task：
+
+```c
+/**
+ * auditd_test_task - Check to see if a given task is an audit daemon
+ * @task: the task to check
+ *
+ * Description:
+ * Return 1 if the task is a registered audit daemon, 0 otherwise.
+ */
+int auditd_test_task(struct task_struct *task)
+{
+	int rc;
+	struct auditd_connection *ac;
+
+	rcu_read_lock();
+	ac = rcu_dereference(auditd_conn); // 
+	rc = (ac && ac->pid == task_tgid(task) ? 1 : 0); 
+    // task_tgid通过task_struct获取pid结构体，而ac是Linux audit守护进程，负责将审计记录写入磁盘，使用ausearch或aureport实用程序查看日志。
+	rcu_read_unlock();
+
+	return rc;
+}
+```
+
+然后回到group_send_sig_info函数，我们聚焦到do_send_sig_info函数：
+
+```c
+int do_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p,
+			enum pid_type type)
+{
+	unsigned long flags;
+	int ret = -ESRCH;
+
+	if (lock_task_sighand(p, &flags)) { // 获取信号处理函数锁
+		ret = send_signal(sig, info, p, type);
+		unlock_task_sighand(p, &flags);
+	}
+
+	return ret;
+}
+```
+
+调用send_signal：
+
+```c
+static int send_signal(int sig, struct kernel_siginfo *info, struct task_struct *t,
+			enum pid_type type)
+{
+	/* Should SIGKILL or SIGSTOP be received by a pid namespace init? */
+    // pid namespace init是否需要接收SIGKILL or SIGSTOP
+	bool force = false;
+
+	if (info == SEND_SIG_NOINFO) {
+		/* Force if sent from an ancestor pid namespace */
+        // 如果来自祖先用户空间，则强制发送
+		force = !task_pid_nr_ns(current, task_active_pid_ns(t));
+	} else if (info == SEND_SIG_PRIV) {
+		/* Don't ignore kernel generated signals */
+        // 来自内核的信号不会被忽略
+		force = true;
+	} else if (has_si_pid_and_uid(info)) {
+		/* SIGKILL and SIGSTOP is special or has ids */
+		struct user_namespace *t_user_ns;
+
+		rcu_read_lock();
+		t_user_ns = task_cred_xxx(t, user_ns);
+		if (current_user_ns() != t_user_ns) {
+			kuid_t uid = make_kuid(current_user_ns(), info->si_uid);
+			info->si_uid = from_kuid_munged(t_user_ns, uid);
+		}
+		rcu_read_unlock();
+
+		/* A kernel generated signal? */
+		force = (info->si_code == SI_KERNEL);
+
+		/* From an ancestor pid namespace? */
+		if (!task_pid_nr_ns(current, task_active_pid_ns(t))) {
+			info->si_pid = 0;
+			force = true;
+		}
+	}
+	return __send_signal(sig, info, t, type, force);
+}
+```
+
+task_pid_nr_ns我们刚刚已经讲过了，让我们再讲一遍：
+
+```c
+pid_t __task_pid_nr_ns(struct task_struct *task, enum pid_type type,
+			struct pid_namespace *ns)
+{
+    //参数中的 ns = task_active_pid_ns(t)是返回目标进程的namespace
+    // 这里的task是current，也就是当前进程的task_struct
+	pid_t nr = 0;  // pid_t 宏定义 int 变量
+
+	rcu_read_lock(); // 申请rcu锁
+	if (!ns)
+		ns = task_active_pid_ns(current); // 返回pid也就是调用kill的进程所在的命名空间
+	nr = pid_nr_ns(rcu_dereference(*task_pid_ptr(task, type)), ns); // 从当前namespace 中找到对应的pid号
+	rcu_read_unlock(); // 释放rcu锁
+
+	return nr;
+}
+```
+
+然后来到pid_nr_ns：
+
+```c
+pid_t pid_nr_ns(struct pid *pid, struct pid_namespace *ns)
+{
+	struct upid *upid;
+	pid_t nr = 0;
+
+	if (pid && ns->level <= pid->level) {
+		upid = &pid->numbers[ns->level]; // 获取和目标进程处于同一level的namespace
+		if (upid->ns == ns) // 当前进程和目标进程是不是同一个命名空间
+			nr = upid->nr;
+	}
+	return nr;
+}
+```
+
+在这里，我们使用kill命令发送signal的进程和目标进程之间的关系存在3种情况：
+
+- 处于同一个namespace：
+  - 那么也就是&ns.level==&pid.level，而且&pid->numbers[ns->level] == ns，最终结果返回当前进程pid
+- 当前进程处于目标进程的父namespace：
+  - 则&pid.level < &ns.level，最终返回0
+
+所以由于pid > 0，结果!task_pid_nr_ns(current, task_active_pid_ns(t))情况如下：
+
+- 处于同一个namespace：False
+- 当前进程处于目标进程的父namespace：True
+
+所以，如果当前进程处于目标进程的祖先namespace，那这个信号一定会被传递给init进程。
+
+```mermaid
+stateDiagram
+    [*] --> SYSCALL_DEFINE2
+    SYSCALL_DEFINE2 --> prepare_kill_siginfo
+    prepare_kill_siginfo --> task_tgid_vnr
+    task_tgid_vnr --> pid_nr_ns
+    from_kuid_munged --> current_user_ns
+    prepare_kill_siginfo --> kill_something_info
+    kill_something_info --> kill_proc_info
+    kill_proc_info --> kill_pid_info
+    kill_pid_info --> group_send_sig_info
+    group_send_sig_info --> kill_pid_info
+    group_send_sig_info --> check_kill_permission
+    group_send_sig_info --> do_send_sig_info
+    check_kill_permission --> security_task_kill
+    security_task_kill --> do_send_sig_info
+    do_send_sig_info --> send_signal
+    send_signal --> task_pid_nr_ns
+    send_signal --> has_si_pid_and_uid
+    has_si_pid_and_uid --> current_user_ns
+    task_pid_nr_ns --> task_active_pid_ns
+    send_signal --> __send_signal
+    __send_signal --> [*]
+```
+
