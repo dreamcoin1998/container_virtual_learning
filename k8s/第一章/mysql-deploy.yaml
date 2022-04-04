@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment # 此资源的类型
+metadata:
+  labels:
+    app: mysql
+  name: mysql
+spec: # deployment 的相关属性的定义
+  replicas: 1 # 确保当前的集群中有且仅有replicas个pod实例再运行，为1表示只能运行1个pod实例
+  selector: # 选择器，符合条件的pods将受到此deployment的管理
+    matchLabels:
+      app: mysql
+  template: # 如果pod实例小于1个，那么会根据这里定义的pod模板生成一个新的pod实例
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - image: mysql:5.7
+        name: mysql
+        ports:
+        - containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "123456"
